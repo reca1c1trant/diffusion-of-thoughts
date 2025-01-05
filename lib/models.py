@@ -1,12 +1,6 @@
-import apex.normalization
-# try:
-#     import flash_attn.flash_attn_interface
-#     import flash_attn.ops.fused_dense
-#     use_flash_attn = True
-# except:
 import xformers.ops
     # use_flash_attn = False
-
+ 
 import lib.utils
 import mup
 import numpy as np
@@ -16,10 +10,24 @@ import torch.utils.checkpoint
 import torch.nn.functional as F
 from einops import rearrange
 from torch import nn, optim
-
-
+ 
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+ 
+    def forward(self, x):
+        # 计算 RMS
+        norm_x = x.norm(2, dim=-1, keepdim=True)
+        rms_x = norm_x * x.shape[-1] ** (-1. / 2)
+        x_normed = x / (rms_x + self.eps)
+        
+        # 应用缩放参数
+        return self.weight * x_normed
+    
 class MLP(nn.Module):
-    def __init__(
+    def __init__( 
         self,
         in_features,
         hidden_features=None,
@@ -30,11 +38,11 @@ class MLP(nn.Module):
         super().__init__()
         self.fc1 = nn.Linear(in_features, hidden_features, bias=bias1)
         self.fc2 = nn.Linear(hidden_features, out_features, bias=bias2)
-
+ 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         return self.fc2(F.gelu(self.fc1(inputs),approximate="tanh"))
-
-
+ 
+ 
 class LayerNorm(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -44,7 +52,7 @@ class LayerNorm(nn.Module):
         with torch.cuda.amp.autocast(enabled=False):
             x = F.layer_norm(x.float(), [self.dim])
         return x * self.weight[None,None,:]
-
+ 
 def residual_linear(x, W, x_skip, residual_scale):
     """x_skip + residual_scale * W @ x"""
     dim_out, dim_in = W.shape[0], W.shape[1]
@@ -54,31 +62,29 @@ def residual_linear(x, W, x_skip, residual_scale):
         W.T,
         alpha=residual_scale
     ).view(*x.shape[:-1], dim_out)
-
-
+ 
+ 
 class TransformerBlock(nn.Module):
     def __init__(self, dim, n_heads, causal, residual_scale):
         super().__init__()
-
+ 
         self.causal = causal
         self.dim = dim
         self.n_heads = n_heads
         self.residual_scale = residual_scale
-
-        self.rmsnorm1 = apex.normalization.FusedRMSNorm(dim)
+ 
+        # 将 apex.normalization.FusedRMSNorm 替换为自定义的 RMSNorm
+        self.rmsnorm1 = RMSNorm(dim)
         self.attn_qkv = nn.Linear(dim, 3*dim, bias=False)
         self.attn_out = nn.Linear(dim, dim, bias=False)
-
-        self.rmsnorm2 = apex.normalization.FusedRMSNorm(dim)
-        # if use_flash_attn:
-        #     self.mlp = flash_attn.ops.fused_dense.FusedMLP(
-        #         dim, 4*dim, bias1=False, bias2=False, checkpoint_lvl=1)
-        # else:
+ 
+        self.rmsnorm2 = RMSNorm(dim)
         self.mlp = MLP(dim, 4*dim, dim, bias1=False, bias2=False)
-
+ 
+    # forward 函数保持不变
     def forward(self, x, rotary_cos_sin, cu_seqlens=None, attn_mask=None):
         batch_size, seq_len = x.shape[0], x.shape[1]
-
+ 
         # Self-attention block
         x_skip = x
         x = self.rmsnorm1(x)
@@ -94,30 +100,16 @@ class TransformerBlock(nn.Module):
             qkv = lib.rotary.apply_rotary_pos_emb(
                 qkv, cos.to(half_dtype), sin.to(half_dtype)
             )
-        # flash attention doesn't support attention mask 
-        # if use_flash_attn:
-        #     qkv = rearrange(qkv, 'b s ... -> (b s) ...')
-        #     if cu_seqlens is None:
-        #         cu_seqlens = torch.arange(
-        #             0, (batch_size + 1) * seq_len, step=seq_len,
-        #             dtype=torch.int32, device=qkv.device
-        #         )
-        #     x = flash_attn.flash_attn_interface.flash_attn_varlen_qkvpacked_func(
-        #         qkv, cu_seqlens, seq_len, 0., causal=self.causal)
-        #     x = rearrange(x, '(b s) h d -> b s (h d)', b=batch_size)
-        # else:
-
+ 
         if attn_mask is None:
             attn_bias = None
         else:
-            # b s, ensure memory is aligned by slicing a bigger tensor.
             round_seq_len = (seq_len//8 + 1)*8
             attn_bias = torch.zeros((batch_size, round_seq_len), dtype=qkv.dtype)
             attn_bias[:, :seq_len].masked_fill_(~attn_mask , float("-inf"))
-            # b h s s 
             attn_bias = attn_bias.unsqueeze(1).unsqueeze(-1).repeat(1, self.n_heads, 1, round_seq_len)
             attn_bias = attn_bias[:,:,:seq_len,:seq_len]
-
+ 
         x = xformers.ops.memory_efficient_attention(
                 qkv[:,:,0], qkv[:,:,1], qkv[:,:,2], attn_bias=attn_bias
             )
@@ -126,15 +118,15 @@ class TransformerBlock(nn.Module):
         x = residual_linear(
             x, self.attn_out.weight, x_skip, self.residual_scale
         )
-
+ 
         # Feedforward block
         x_skip = x
         x = self.rmsnorm2(x)
         x = self.mlp(x)
         x = torch.add(x_skip, x, alpha=self.residual_scale)
-
+ 
         return x
-
+ 
 class EmbeddingMatrix(nn.Module):
     def __init__(self, vocab_size, embed_dim):
         super().__init__()
@@ -143,7 +135,7 @@ class EmbeddingMatrix(nn.Module):
     def forward(self):
         norm = torch.linalg.norm(self.matrix, dim=1, keepdim=True)
         return (self.matrix / (norm + 1e-8))
-
+ 
 class NoiseSchedule(nn.Module):
     def __init__(self):
         super().__init__()
@@ -167,7 +159,7 @@ class NoiseSchedule(nn.Module):
             (gamma_tilde_t - gamma_tilde_0) /
             (gamma_tilde_1 - gamma_tilde_0)
         )
-
+ 
 class GammaBounds(nn.Module):
     def __init__(self, gamma_0, gamma_1):
         super().__init__()
@@ -175,48 +167,48 @@ class GammaBounds(nn.Module):
         self.gamma_1 = nn.Parameter(torch.tensor(float(gamma_1)))
     def forward(self):
         return self.gamma_0.clone().double(), self.gamma_1.clone().double()
-
+ 
 class DiffusionModel(nn.Module):
     def __init__(self, dim, embed_dim, n_blocks, n_heads, vocab_size):
         super().__init__()
-
+ 
         self.input_linear = nn.Linear(embed_dim, dim, bias=False)
         self.selfcond_linear = nn.Linear(embed_dim, dim, bias=False)
         self.selfcond_linear.weight.data.zero_()
         self.gamma_linear = nn.Linear(64, dim, bias=False)
         self.gamma_linear.weight.data.zero_()
-
+ 
         self.rotary_emb = lib.rotary.Rotary(dim // n_heads)
-
+ 
         residual_scale = float(1./np.sqrt(n_blocks))
         self.blocks = nn.ModuleList([
             TransformerBlock(dim, n_heads, False, residual_scale)
             for i in range(n_blocks)
         ])
-
+ 
         self.output_norm = lib.models.LayerNorm(dim)
         self.output_linear = mup.MuReadout(dim, vocab_size)
         self.output_linear.weight.data.zero_()
         self.output_linear.bias.data.zero_()
-
+ 
         self.dim = dim
         self.embed_dim = embed_dim
         self.vocab_size = vocab_size
-
+ 
     def forward(self, z, gamma, embedding_matrix, bias_scale, x_selfcond,
         selfcond_mask=None, cu_seqlens=None, attn_mask=None, x_embed=None, src_mask=None):
-
+ 
         if selfcond_mask is None:
             selfcond_mask = torch.ones(z.shape[0], device='cuda')
-
+ 
         alpha_squared = torch.sigmoid(-gamma)[:,None,None]
         sigma_squared = torch.sigmoid(gamma)[:,None,None]
         alpha = alpha_squared.sqrt()
-
+ 
         # Rescale input to stdev 1
         z_variance = (alpha_squared / self.embed_dim) + sigma_squared
         x = z / z_variance.sqrt().float()
-
+ 
         # assume src part has already been recovered
         if x_embed is not None:
             if src_mask is not None:
@@ -226,29 +218,29 @@ class DiffusionModel(nn.Module):
             else:
                 x = x_embed
                 x_selfcond = x_embed
-
+ 
         x = self.input_linear(x)
-
+ 
         x = x + self.selfcond_linear(
             x_selfcond * float(np.sqrt(self.embed_dim))
         )
-
+ 
         gamma_embed = torch.linspace(-5., 5., 64 // 2, device='cuda')
         gamma_embed = gamma_embed.exp()[None,:] * gamma[:,None]
         gamma_embed = torch.cat([gamma_embed.sin(), gamma_embed.cos()], dim=1)
         gamma_embed = self.gamma_linear(gamma_embed.float())[:,None,:]
         x = x + gamma_embed
-
+ 
         rotary_cos_sin = self.rotary_emb(x)
         # with torch.cuda.amp.autocast(dtype=torch.bfloat16):  # v100 not support
         with torch.cuda.amp.autocast(dtype=torch.float16):
             for i in range(len(self.blocks)):
                 x = self.blocks[i](x, rotary_cos_sin, cu_seqlens=cu_seqlens, attn_mask=attn_mask)
-
+ 
         x = self.output_norm(x.float())
-
+ 
         x *= self.output_linear.output_mult/self.output_linear.width_mult()
-
+ 
         W = torch.cat([
             self.output_linear.weight.T,
             embedding_matrix.T,
@@ -265,7 +257,7 @@ class DiffusionModel(nn.Module):
             x.view(-1, self.dim + 2*self.embed_dim),
             W.view(self.dim + 2*self.embed_dim, self.vocab_size)
         ).view(x.shape[0], x.shape[1], self.vocab_size)
-
+ 
         # Comment for 'no categorical reparameterization' ablation
         x_reconst = F.softmax(logits, dim=2)
         x_reconst = x_reconst @ torch.cat([
@@ -280,7 +272,7 @@ class DiffusionModel(nn.Module):
         #     x_reconst = torch.where(src_mask, x_embed, x_reconst)
         
         return logits, x_reconst
-
+ 
 class AutoregressiveModel(nn.Module):
     def __init__(self, dim, n_blocks, n_heads, vocab_size, tie_embeddings):
         super().__init__()
@@ -288,23 +280,24 @@ class AutoregressiveModel(nn.Module):
         if not tie_embeddings:
             self.input_embedding = nn.Embedding(vocab_size, dim)
         self.rotary_emb = lib.rotary.Rotary(dim // n_heads)
-
+ 
         residual_scale = float(1./np.sqrt(n_blocks))
         self.blocks = nn.ModuleList([
             TransformerBlock(dim, n_heads, True, residual_scale)
             for i in range(n_blocks)
         ])
-        self.output_norm = apex.normalization.FusedRMSNorm(dim)
+        # 将 apex.normalization.FusedRMSNorm 替换为自定义的 RMSNorm
+        self.output_norm = RMSNorm(dim)
         self.output_linear = mup.MuReadout(dim, vocab_size)
         self.first_token_logits = nn.Parameter(torch.zeros(vocab_size))
-
+ 
+    # forward 函数保持不变
     def forward(self, x):
         if self.tie_embeddings:
             x = F.embedding(x, self.output_linear.weight) * float(np.sqrt(3*256))
         else:
             x = self.input_embedding(x)
         rotary_cos_sin = self.rotary_emb(x)
-        # with torch.cuda.amp.autocast(dtype=torch.bfloat16):
         with torch.cuda.amp.autocast(dtype=torch.float16):
             for i in range(len(self.blocks)):
                 x = self.blocks[i](x, rotary_cos_sin)

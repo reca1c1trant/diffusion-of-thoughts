@@ -61,22 +61,72 @@ def split_gsm8k_target(target):
     splits = splits[:-3] + [' '.join(splits[-3:])] 
     return [' '+i for i in splits]
 
+import json
+
 def get_gsm8k_dataset(split):
-    with open(f'data/gsm8k/{split}.txt', encoding="utf-8") as f:
-        lines = [line.split('||') for line in f.read().splitlines() 
-                if (len(line) > 0 and not line.isspace()
-                                    and len(line.split('||')) ==2 )]
-        src_lines, tgt_lines = list(zip(*lines))
-        src_lines = list(src_lines)
-        tgt_lines = list(tgt_lines)
-        res = datasets.Dataset.from_dict(
-            {
-                'src': src_lines, 
-                'tgt': [split_gsm8k_target(i) for i in tgt_lines],
-                'task_id': [i for i in range(len(src_lines))]
-            }
-        )
-        return res
+    """
+    从本地JSON文件加载GSM8K数据集
+    Args:
+        split: 'train' 或 'test'
+    Returns:
+        datasets.Dataset: 包含 src, tgt, task_id 的数据集
+    """
+    import datasets
+    
+    filename = f"data/gsm8k/{split}.txt"
+    
+    try:
+        parsed_data = {
+            'src': [],
+            'tgt': [],
+            'task_id': []
+        }
+        
+        with open(filename, 'r', encoding='utf-8') as f:
+            for idx, line in enumerate(f):
+                # 解析JSON
+                data = json.loads(line.strip())
+                question = data['question'].strip()
+                answer = data['answer'].strip()
+                
+                # 提取答案步骤
+                answer_steps = []
+                final_answer = ''
+                last_line = ''
+                
+                for ans_line in answer.split('\n'):
+                    if ans_line.startswith('####'):
+                        final_answer = ans_line.replace('####', '').strip()
+                        break
+                    # 保存每个步骤的答案
+                    last_line = ans_line.strip()
+                    answer_steps.append(ans_line.strip())
+                
+                if not final_answer and last_line:
+                    final_answer = last_line
+                
+                answer_steps.append(final_answer)
+                
+                parsed_data['src'].append(question + ' = ')  # 添加 = 保持格式一致
+                parsed_data['tgt'].append(answer_steps)
+                parsed_data['task_id'].append(idx)
+                
+        if not parsed_data['src']:
+            raise ValueError(f"No data loaded from {filename}")
+            
+        # 创建Dataset对象
+        dataset = datasets.Dataset.from_dict(parsed_data)
+        
+        print(f"Successfully loaded {len(dataset)} examples from {filename}")
+        
+        return dataset
+        
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Dataset file not found: {filename}")
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Error parsing JSON in {filename}: {e}")
+    except Exception as e:
+        raise Exception(f"Error loading dataset from {filename}: {e}")
 
 
 def split_5by5_target(text):
