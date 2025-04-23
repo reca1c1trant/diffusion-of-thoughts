@@ -23,6 +23,264 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from lib.datasets import get_dataloader, get_dataloaders, infinite_loader
 from evaluation_batch import evaluate, generate_samples
 
+# 首先导入SelfCheck模块
+from lib.selfcheck import SelfCheckVerifier
+
+class SelfCheckConfig:
+    def __init__(self, 
+                enabled=False, 
+                confidence_threshold=0.7, 
+                weight=0.1, 
+                apply_corrections=True):
+        self.enabled = enabled
+        self.confidence_threshold = confidence_threshold
+        self.weight = weight
+        self.apply_corrections = apply_corrections
+
+def train_loop_with_selfcheck(args, modules, tokenizer, train_iterator, train_mode=True):
+    """
+    修改后的训练循环，包含SelfCheck机制
+    """
+    # 创建SelfCheck验证器
+    verifier = SelfCheckVerifier(tokenizer, modules, args)
+    
+    # 原有参数设置
+    batch_size = args.batch_size
+    reconst_weight = args.reconst_weight
+    diffusion_weight = args.diffusion_weight
+    reconst_bs_cache = {}
+    
+    # SelfCheck相关参数
+    use_selfcheck = args.use_selfcheck
+    confidence_threshold = args.confidence_threshold
+    
+    # 初始化训练状态
+    reconst_ema = torch.tensor(1e-8).cuda()
+    diffusion_ema = torch.tensor(1e-8).cuda()
+    reconst_sqr_ema = torch.tensor(1e-8).cuda()
+    diffusion_sqr_ema = torch.tensor(1e-8).cuda()
+    loss_ema_bias = torch.tensor(1e-8).cuda()
+    
+    # 设置模型到训练模式
+    for name, module in modules.items():
+        module.train(train_mode)
+    
+    # 获取一个批次的数据
+    x, src_mask, tgt_mask = next(train_iterator)
+    x = x.cuda()
+    src_mask = src_mask.cuda()
+    tgt_mask = tgt_mask.cuda()
+    
+    # 计算reconst_bs (重建批次大小)
+    if step in reconst_bs_cache:
+        reconst_bs = reconst_bs_cache[step]
+    else:
+        # 原有的reconst_bs计算逻辑
+        b = 1 / loss_ema_bias
+        reconst_std = (b*reconst_sqr_ema - (b*reconst_ema)**2).clamp(min=0).sqrt()
+        diffusion_std = (b*diffusion_sqr_ema - (b*diffusion_ema)**2).clamp(min=0).sqrt()
+        reconst_bs = batch_size * (reconst_std / (1e-8 + reconst_std + diffusion_std))
+        reconst_bs = int(reconst_bs.round().clamp(1, batch_size-1))
+        reconst_bs_cache[step] = reconst_bs
+    
+    # 准备timesteps采样
+    t = torch.empty([batch_size], device='cuda')
+    t[:reconst_bs] = 0
+    
+    # 采样剩余的timesteps
+    t[reconst_bs:] = torch.linspace(0, 1, batch_size-reconst_bs+1)[1:]
+    
+    # 噪声采样
+    embedding_matrix = modules['embedding_matrix']()
+    x_embed = embedding_matrix[x]
+    noise = torch.randn_like(x_embed)
+    
+    # 扩散过程
+    gamma = modules['noise_schedule'](t)
+    gamma_0 = modules['noise_schedule'](torch.zeros_like(t))
+    gamma_1 = modules['noise_schedule'](torch.ones_like(t))
+    
+    alpha_t = torch.sqrt((1 - gamma / gamma_1))
+    sigma_t = torch.sqrt(gamma / gamma_1)
+    
+    # 添加噪声生成z
+    z = alpha_t[:, None, None] * x_embed + sigma_t[:, None, None] * noise
+    
+    # 进行自我条件采样
+    x_selfcond = torch.zeros_like(x_embed, device='cuda', dtype=torch.float32)
+    
+    # ===== SelfCheck修改点：在使用模型前进行步骤验证和筛选 =====
+    if use_selfcheck and args.cot:
+        # 提取每个样本的问题和思考步骤
+        questions = []
+        all_steps = []
+        
+        for i in range(batch_size):
+            text = tokenizer.decode(x[i].tolist())
+            parts = text.split(lib.datasets.SEP_TOKEN)
+            
+            if len(parts) > 1:
+                # 假设第一部分是问题
+                question = parts[0].strip()
+                # 剩余部分是思考步骤
+                steps = [p.strip() for p in parts[1:] if p.strip()]
+                
+                questions.append(question)
+                all_steps.append(steps)
+            else:
+                # 如果没有分隔符，整个文本作为问题
+                questions.append(text)
+                all_steps.append([])
+        
+        # 对需要进行推理的样本（t>0）进行SelfCheck
+        for i in range(reconst_bs, batch_size):
+            if len(all_steps[i]) > 0:
+                # 对最后一个步骤进行验证
+                last_step = all_steps[i][-1]
+                previous_steps = all_steps[i][:-1]
+                
+                try:
+                    # 进行验证
+                    confidence, verified_step = verifier.verify_step(
+                        questions[i],
+                        last_step,
+                        previous_steps,
+                        len(previous_steps)
+                    )
+                    
+                    # 如果置信度低，使用修正的步骤
+                    if confidence < confidence_threshold:
+                        # 替换最后一个步骤
+                        all_steps[i][-1] = verified_step
+                        
+                        # 重新构建输入
+                        new_text = questions[i] + lib.datasets.SEP_TOKEN
+                        new_text += lib.datasets.SEP_TOKEN.join(all_steps[i])
+                        
+                        # 重新编码
+                        new_tokens = tokenizer.encode(new_text)[:x.shape[1]]
+                        # 如果长度不足，填充
+                        if len(new_tokens) < x.shape[1]:
+                            padding = [lib.datasets.PAD_TOKEN_ID] * (x.shape[1] - len(new_tokens))
+                            new_tokens.extend(padding)
+                        
+                        # 更新x
+                        x[i] = torch.tensor(new_tokens, device=x.device)
+                        
+                        # 更新embedding
+                        x_embed[i] = embedding_matrix[x[i]]
+                        
+                        # 重新计算z
+                        z[i] = alpha_t[i] * x_embed[i] + sigma_t[i] * noise[i]
+                except Exception as e:
+                    # 出错时记录但继续执行
+                    print(f"SelfCheck error: {e}")
+    
+    # 设置bias scale
+    if train_mode:
+        bias_scale = min(1., (step + 1e-8) / (args.bias_warmup_steps + 1e-8))
+    else:
+        bias_scale = 1.
+    
+    # 模型前向传播
+    # 使用自我条件
+    logits_selfcond, x_reconst_selfcond = modules['model'](
+        z_selfcond=z, 
+        gamma_selfcond=gamma, 
+        embedding_matrix=embedding_matrix, 
+        bias_scale=bias_scale,
+        x_selfcond=x_selfcond,
+        x_embed=x_embed if args.fix_src else None,
+        src_mask=src_mask if args.fix_src else None
+    )
+    
+    # ===== SelfCheck修改点：在训练损失中添加SelfCheck损失 =====
+    # 计算原始损失
+    reconst_loss = F.cross_entropy(
+        logits_selfcond.reshape(-1, logits_selfcond.shape[-1]),
+        x.reshape(-1),
+        reduction='none'
+    ).reshape(x.shape)
+    
+    reconst_loss_masked = (reconst_loss * tgt_mask).sum(-1)
+    reconst_loss = (reconst_loss_masked / tgt_mask.sum(-1)).mean()
+    
+    # 计算扩散损失
+    eps_pred = noise - (z - alpha_t[:, None, None] * x_reconst_selfcond) / sigma_t[:, None, None]
+    diffusion_loss = (eps_pred ** 2).mean()
+    
+    # 如果使用SelfCheck，添加SelfCheck损失
+    if use_selfcheck and args.cot:
+        # 创建SelfCheck损失
+        selfcheck_loss = 0.0
+        
+        # 获取模型预测
+        predicted_steps = []
+        for i in range(reconst_bs, batch_size):
+            pred_tokens = logits_selfcond[i].argmax(dim=-1)
+            pred_text = tokenizer.decode(pred_tokens.tolist())
+            predicted_steps.append(pred_text)
+        
+        # 针对每个样本计算SelfCheck损失
+        selfcheck_losses = []
+        for i, (pred, truth) in enumerate(zip(predicted_steps, all_steps[reconst_bs:])):
+            # 略过没有步骤的样本
+            if not truth:
+                continue
+                
+            # 提取预测的最后一个步骤
+            pred_parts = pred.split(lib.datasets.SEP_TOKEN)
+            if len(pred_parts) > 1:
+                pred_last_step = pred_parts[-1].strip()
+            else:
+                pred_last_step = pred
+                
+            # 提取真实的最后一个步骤
+            truth_last_step = truth[-1]
+            
+            try:
+                # 使用验证器计算置信度
+                confidence, _ = verifier.compare_steps(
+                    pred_last_step,
+                    truth_last_step,
+                    questions[i + reconst_bs],
+                    "完成推理" # 简化的目标描述
+                )
+                
+                # 将置信度转换为损失
+                # 低置信度对应高损失
+                step_loss = 1.0 - confidence
+                selfcheck_losses.append(step_loss)
+            except Exception as e:
+                print(f"SelfCheck loss error: {e}")
+        
+        # 计算平均SelfCheck损失
+        if selfcheck_losses:
+            selfcheck_loss = torch.tensor(sum(selfcheck_losses) / len(selfcheck_losses),
+                                         device=reconst_loss.device)
+        else:
+            selfcheck_loss = torch.tensor(0.0, device=reconst_loss.device)
+        
+        # 添加到总损失
+        selfcheck_weight = args.selfcheck_weight  # 新参数：SelfCheck损失权重
+        total_loss = reconst_weight * reconst_loss + diffusion_weight * diffusion_loss + selfcheck_weight * selfcheck_loss
+    else:
+        # 原始损失计算
+        total_loss = reconst_weight * reconst_loss + diffusion_weight * diffusion_loss
+    
+    # 更新模型参数
+    total_loss.backward()
+    
+    # 更新EMA统计
+    if train_mode:
+        with torch.no_grad():
+            loss_ema_bias.lerp_(torch.tensor(1., device='cuda'), 1 - args.reconst_bs_ema)
+            reconst_ema.lerp_((args.reconst_weight * reconst_loss).sum() / avg_reconst_bs, 1 - args.reconst_bs_ema)
+            reconst_sqr_ema.lerp_((args.reconst_weight * reconst_loss).pow(2).sum() / avg_reconst_bs, 1 - args.reconst_bs_ema)
+            diffusion_ema.lerp_((args.diffusion_weight * diffusion_loss).sum() / avg_diffusion_bs, 1 - args.reconst_bs_ema)
+            diffusion_sqr_ema.lerp_((args.diffusion_weight * diffusion_loss).pow(2).sum() / avg_diffusion_bs, 1 - args.reconst_bs_ema)
+    
+    return total_loss
 
 def masked_loss(loss, mask, weight, dim=None):
     loss = loss.masked_fill(~mask, 0)
@@ -60,6 +318,167 @@ def set_seed(seed: int):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+# 在train.py中修改
+def forward_with_selfcheck(step, idx_in_batch, batch_size, tokenizer=None, selfcheck_verifier=None, selfcheck_config=None):
+    """
+    支持SelfCheck的前向传播函数
+    """
+    # 获取数据
+    x, src_mask, tgt_mask = next(train_iterator)
+    x = x.cuda()
+    src_mask = src_mask.cuda()
+    tgt_mask = tgt_mask.cuda()
+    
+    # 原始处理逻辑
+    batch_size = x.shape[0]
+    reconst_bs = args.reconst_bs
+    
+    # Diffusion过程与原始代码相同
+    embedding_matrix = modules['embedding_matrix']()
+    x_embed = embedding_matrix[x]
+    noise = torch.randn_like(x_embed)
+    
+    # 时间步和噪声参数与原始代码相同
+    t = torch.empty([batch_size], device='cuda')
+    t[:reconst_bs] = 0
+    t[reconst_bs:] = torch.linspace(0, 1, batch_size-reconst_bs+1)[1:]
+    
+    gamma = modules['noise_schedule'](t)
+    gamma_0 = modules['noise_schedule'](torch.zeros_like(t))
+    gamma_1 = modules['noise_schedule'](torch.ones_like(t))
+    
+    alpha_t = torch.sqrt((1 - gamma / gamma_1))
+    sigma_t = torch.sqrt(gamma / gamma_1)
+    
+    z = alpha_t[:, None, None] * x_embed + sigma_t[:, None, None] * noise
+    
+    # 自我条件化参数
+    x_selfcond = torch.zeros_like(x_embed, device='cuda', dtype=torch.float32)
+    
+    # ===== SelfCheck逻辑 =====
+    selfcheck_loss = torch.tensor(0.0, device='cuda')
+    
+    if selfcheck_config and selfcheck_config.enabled and args.cot and selfcheck_verifier and tokenizer:
+        # 提取问题和思考步骤
+        questions = []
+        all_steps = []
+        
+        for i in range(batch_size):
+            text = tokenizer.decode(x[i].tolist())
+            parts = text.split(lib.datasets.SEP_TOKEN)
+            
+            if len(parts) > 1:
+                # 假设第一部分是问题
+                question = parts[0].strip()
+                # 剩余部分是思考步骤
+                steps = [p.strip() for p in parts[1:] if p.strip()]
+                
+                questions.append(question)
+                all_steps.append(steps)
+            else:
+                # 如果没有分隔符，整个文本作为问题
+                questions.append(text)
+                all_steps.append([])
+        
+        # 对需要进行推理的样本(t>0)应用SelfCheck
+        modified = False
+        for i in range(reconst_bs, batch_size):
+            if len(all_steps[i]) > 0:
+                # 对最后一个步骤进行验证
+                last_step = all_steps[i][-1]
+                previous_steps = all_steps[i][:-1]
+                
+                try:
+                    # 进行验证
+                    confidence, verified_step = selfcheck_verifier.verify_step(
+                        questions[i],
+                        last_step,
+                        previous_steps,
+                        len(previous_steps)
+                    )
+                    
+                    # 计算SelfCheck损失（1 - 置信度）
+                    step_loss = 1.0 - confidence
+                    selfcheck_loss = selfcheck_loss + step_loss
+                    
+                    # 如果置信度低且需要修正
+                    if confidence < selfcheck_config.confidence_threshold and selfcheck_config.apply_corrections:
+                        # 替换最后一个步骤
+                        all_steps[i][-1] = verified_step
+                        modified = True
+                        
+                except Exception as e:
+                    logging.warning(f"SelfCheck error: {e}")
+        
+        # 如果有修改，更新输入
+        if modified:
+            for i in range(reconst_bs, batch_size):
+                if len(all_steps[i]) > 0:
+                    # 重新构建输入
+                    new_text = questions[i] + lib.datasets.SEP_TOKEN
+                    new_text += lib.datasets.SEP_TOKEN.join(all_steps[i])
+                    
+                    # 重新编码
+                    new_tokens = tokenizer.encode(new_text)[:x.shape[1]]
+                    # 如果长度不足，填充
+                    if len(new_tokens) < x.shape[1]:
+                        padding = [lib.datasets.PAD_TOKEN_ID] * (x.shape[1] - len(new_tokens))
+                        new_tokens.extend(padding)
+                    
+                    # 更新x
+                    x[i] = torch.tensor(new_tokens, device=x.device)
+                    
+                    # 更新embedding
+                    x_embed[i] = embedding_matrix[x[i]]
+                    
+                    # 更新z
+                    z[i] = alpha_t[i] * x_embed[i] + sigma_t[i] * noise[i]
+        
+        # 计算平均SelfCheck损失
+        if batch_size > reconst_bs:
+            selfcheck_loss = selfcheck_loss / (batch_size - reconst_bs)
+        else:
+            selfcheck_loss = torch.tensor(0.0, device='cuda')
+    
+    # 设置bias scale
+    bias_scale = min(1., (step + 1e-8) / (args.bias_warmup_steps + 1e-8)) if train_mode else 1.
+    
+    # 模型前向传播
+    logits, x_reconst = modules['model'](
+        z_selfcond=z, 
+        gamma_selfcond=gamma, 
+        embedding_matrix=embedding_matrix, 
+        bias_scale=bias_scale,
+        x_selfcond=x_selfcond,
+        x_embed=x_embed if args.fix_src else None,
+        src_mask=src_mask if args.fix_src else None
+    )
+    
+    # 计算损失
+    reconst_loss = F.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]),
+        x.reshape(-1),
+        reduction='none'
+    ).reshape(x.shape)
+    
+    reconst_loss_masked = (reconst_loss * tgt_mask).sum(-1)
+    reconst_loss = (reconst_loss_masked / tgt_mask.sum(-1)).mean()
+    
+    # 计算扩散损失
+    eps_pred = noise - (z - alpha_t[:, None, None] * x_reconst) / sigma_t[:, None, None]
+    diffusion_loss = (eps_pred ** 2).mean()
+    
+    # 计算总损失
+    total_loss = args.reconst_weight * reconst_loss + args.diffusion_weight * diffusion_loss
+    
+    # 如果启用SelfCheck，加入SelfCheck损失
+    if selfcheck_config and selfcheck_config.enabled:
+        total_loss = total_loss + selfcheck_config.weight * selfcheck_loss
+        return total_loss, reconst_loss, diffusion_loss, selfcheck_loss
+    else:
+        return total_loss, reconst_loss, diffusion_loss
+
 
 
 def main(**args):
@@ -99,6 +518,15 @@ def main(**args):
     args.setdefault('digit', True) # seperate each digit during tokenization
     args.setdefault('min_prob', 1.) # min prob in scheduled sampling
     args.setdefault('glance', False) # glance sampling in mp-dot
+
+
+    args.setdefault('use_selfcheck', False)  # 是否启用SelfCheck
+    args.setdefault('selfcheck_threshold', 0.7)  # SelfCheck置信度阈值
+    args.setdefault('selfcheck_weight', 0.1)  # SelfCheck损失权重
+    args.setdefault('selfcheck_apply_corrections', True)  # 是否应用SelfCheck修正
+    
+
+
 
     set_args(args)
     lib.utils.print_args(args)
@@ -452,6 +880,18 @@ def main(**args):
             torch.tensor(reconst_bs).cuda(),
         )
 
+    def choose_forward(step=None, accum_step=None, accum_total=None, x_eval=None, 
+                    tokenizer=None, selfcheck_verifier=None, selfcheck_config=None):
+        """
+        根据是否启用SelfCheck选择前向传播函数
+        """
+        if selfcheck_config and selfcheck_config.enabled:
+            return forward_with_selfcheck(step, accum_step, accum_total, x_eval, 
+                                        tokenizer, selfcheck_verifier, selfcheck_config)
+        else:
+            return forward(step, accum_step, accum_total, x_eval)    
+        
+
     learning_rates = {
         'model': args.lr,
         'noise_schedule': 1e-2,
@@ -465,6 +905,19 @@ def main(**args):
         'gamma_bounds': 1e-3,
         'embedding_matrix': 0.,
     }
+
+
+    selfcheck_verifier = None
+    selfcheck_config = None
+    if args.use_selfcheck:
+        # 确保lib/selfcheck.py已正确实现
+        selfcheck_verifier = SelfCheckVerifier(tokenizer, modules, args)
+        selfcheck_config = SelfCheckConfig(
+            enabled=True,
+            confidence_threshold=args.selfcheck_threshold,
+            weight=args.selfcheck_weight,
+            apply_corrections=args.selfcheck_apply_corrections
+        )
 
     def optimizer_impl(param_groups, **kwargs):
         assert('weight_decay' not in kwargs)
@@ -549,8 +1002,10 @@ def main(**args):
                 plt.savefig(f'{args.save_weights_path}/val_nll.jpg')
                 
     logging.info('Starting train loop...')
+    # 选择前向传播函数
+    actual_forward = choose_forward if args.use_selfcheck else forward
     lib.utils.train_loop(
-        forward,
+        actual_forward,
         opt,
         args.steps,
         names=['nll','reconst','prior','gamma_0','gamma_1','reconst_bs'],
@@ -568,6 +1023,10 @@ def main(**args):
             for param in module.parameters()
         ],
         clip_quantile=args.clip_quantile,
+            # 添加SelfCheck相关参数
+        tokenizer=tokenizer if args.use_selfcheck else None,
+        selfcheck_verifier=selfcheck_verifier,
+        selfcheck_config=selfcheck_config,
     )
 
     final_val_nll = compute_nll(iter(valid_loader))

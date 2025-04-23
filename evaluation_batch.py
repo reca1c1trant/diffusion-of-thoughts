@@ -7,12 +7,23 @@ import lib.models
 import lib.utils
 import os
 import torch
+import torch.nn.functional as F
 import logging, sys
 import time
 import random
 import numpy as np
 from lib.dpm_solver_pytorch import NoiseSchedulePlaid, model_wrapper, DPM_Solver, ModelWrapper
 
+from lib.selfcheck import SelfCheckVerifier
+
+class SelfCheckConfig:
+    def __init__(self, 
+                enabled=False, 
+                confidence_threshold=0.7, 
+                apply_corrections=True):
+        self.enabled = enabled
+        self.confidence_threshold = confidence_threshold
+        self.apply_corrections = apply_corrections
 
 def extract_gsm8k_answer(text):
     text = text.split(lib.datasets.EOS_TOKEN)[0]
@@ -59,17 +70,76 @@ def shift_sep_to_pad(tensor, sep_idx, pad_idx):
     new_tensor = new_tensor.type_as(tensor)
     return new_tensor, new_mask
 
-
 def ids_to_txts(tokenizer, x_samples):
     return [tokenizer.decode(x.tolist() if isinstance(x, torch.Tensor) else x, skip_special_tokens=False) 
             for x in x_samples]
 
+# 辅助函数：提取问题
+def extract_question(x_tensor, tokenizer):
+    """从输入张量中提取问题文本"""
+    text = tokenizer.decode(x_tensor.tolist())
+    # 假设问题在第一个分隔符之前
+    question = text.split(lib.datasets.SEP_TOKEN)[0].strip()
+    return question
 
-def generate_samples(x, src_mask, modules, args, timesteps_togo=None):
+# 辅助函数：提取最后一个步骤
+def extract_last_step(x_tensor, tokenizer):
+    """从生成结果中提取最后一个推理步骤"""
+    text = tokenizer.decode(x_tensor.tolist())
+    steps = text.split(lib.datasets.SEP_TOKEN)
+    if len(steps) > 1:
+        return steps[-1].strip()
+    return ""
+
+# 辅助函数：替换最后一个步骤
+def replace_last_step(x_tensor, new_step, tokenizer):
+    """替换最后一个推理步骤"""
+    text = tokenizer.decode(x_tensor.tolist())
+    parts = text.split(lib.datasets.SEP_TOKEN)
+    if len(parts) > 1:
+        parts[-1] = new_step
+    new_text = lib.datasets.SEP_TOKEN.join(parts)
+    new_tokens = tokenizer.encode(new_text)
+    # 创建新的张量
+    new_tensor = torch.tensor(new_tokens, device=x_tensor.device)
+    # 确保长度与原始张量相同
+    if len(new_tensor) > len(x_tensor):
+        new_tensor = new_tensor[:len(x_tensor)]
+    elif len(new_tensor) < len(x_tensor):
+        padding = torch.ones(len(x_tensor) - len(new_tensor), 
+                            dtype=new_tensor.dtype, 
+                            device=new_tensor.device) * lib.datasets.PAD_TOKEN_ID
+        new_tensor = torch.cat([new_tensor, padding])
+    return new_tensor
+
+def generate_samples(x, src_mask, modules, args, timesteps_togo=None, tokenizer=None, selfcheck_verifier=None, selfcheck_config=None):
     '''We go args.sampling_timesteps steps for all inputs if timesteps_togo is None'''
     with torch.no_grad():
         embedding_matrix = modules['embedding_matrix']()
         x_embed = embedding_matrix[x] # batch,seq_len, dim
+
+        # 提取问题和思考步骤，用于SelfCheck
+        batch_size = x.shape[0]
+        questions = []
+        all_steps = []
+        
+        if tokenizer is not None and selfcheck_config is not None and selfcheck_config.enabled and args.cot:
+            for i in range(batch_size):
+                text = tokenizer.decode(x[i].tolist())
+                parts = text.split(lib.datasets.SEP_TOKEN)
+                
+                if len(parts) > 1:
+                    # 假设第一部分是问题
+                    question = parts[0].strip()
+                    # 剩余部分是思考步骤
+                    steps = [p.strip() for p in parts[1:] if p.strip()]
+                    
+                    questions.append(question)
+                    all_steps.append(steps)
+                else:
+                    # 如果没有分隔符，整个文本作为问题
+                    questions.append(text)
+                    all_steps.append([])
 
         if args.dpm_solver:
             noise = torch.randn(x_embed.shape, device=x_embed.device)
@@ -193,21 +263,147 @@ def generate_samples(x, src_mask, modules, args, timesteps_togo=None):
         
         if args.fix_src:
             x_samples = torch.where(src_mask, x, x_samples)
+            
+        # ===== SelfCheck验证步骤 =====
+        if tokenizer is not None and selfcheck_config is not None and selfcheck_config.enabled and args.cot and selfcheck_verifier is not None and questions:
+            # 对每个样本进行处理
+            for i in range(batch_size):
+                # 提取当前生成的步骤
+                current_text = tokenizer.decode(x_samples[i].tolist())
+                current_parts = current_text.split(lib.datasets.SEP_TOKEN)
+                
+                if len(current_parts) > 1:
+                    # 提取最后一个步骤
+                    current_step = current_parts[-1].strip()
+                    
+                    # 获取之前的步骤
+                    previous_steps = all_steps[i]
+                    
+                    try:
+                        # 进行验证
+                        if previous_steps or current_step:  # 只在有步骤时验证
+                            confidence, verified_step = selfcheck_verifier.verify_step(
+                                questions[i],
+                                current_step,
+                                previous_steps,
+                                len(previous_steps)
+                            )
+                            
+                            # 如果置信度低且需要修正
+                            if confidence < selfcheck_config.confidence_threshold and selfcheck_config.apply_corrections:
+                                # 替换最后一个步骤
+                                current_parts[-1] = verified_step
+                                
+                                # 重新构建文本
+                                new_text = lib.datasets.SEP_TOKEN.join(current_parts)
+                                
+                                # 重新编码
+                                new_tokens = tokenizer.encode(new_text)[:x_samples.shape[1]]
+                                # 如果长度不足，填充
+                                if len(new_tokens) < x_samples.shape[1]:
+                                    padding = [lib.datasets.PAD_TOKEN_ID] * (x_samples.shape[1] - len(new_tokens))
+                                    new_tokens.extend(padding)
+                                
+                                # 更新x_samples
+                                x_samples[i] = torch.tensor(new_tokens, device=x_samples.device)
+                    except Exception as e:
+                        logging.warning(f"SelfCheck error: {e}")
 
         return x_samples
 
-def generate_cot_samples(x, src_mask, modules, args):
+def generate_cot_samples(x, src_mask, modules, args, tokenizer=None, selfcheck_verifier=None, selfcheck_config=None):
+    """支持SelfCheck的CoT生成"""
     batch_size = x.shape[0]
     unfinished = x.new_ones(batch_size, dtype=bool)
     end = False
-    for _ in range(args.cot_steps):
-        x[unfinished] = generate_samples(x[unfinished], src_mask[unfinished], modules, args)
-
-        # res_txts = ids_to_txts(x[unfinished])
-        # for res_txt in res_txts:
-        #     res_txt = res_txt.replace(lib.datasets.SEP_TOKEN, "").replace(lib.datasets.PAD_TOKEN, "")
-        #     logging.info(res_txt)
-
+    
+    # 创建SelfCheck验证器（如果需要）
+    if selfcheck_config is not None and selfcheck_config.enabled and selfcheck_verifier is None and tokenizer is not None:
+        selfcheck_verifier = SelfCheckVerifier(tokenizer, modules, args)
+    
+    # 保存各样本的置信度
+    confidence_scores = torch.ones(batch_size, device=x.device)
+    
+    # 记录每个样本的推理步骤
+    all_steps = [[] for _ in range(batch_size)]
+    original_questions = []
+    
+    if tokenizer is not None and selfcheck_config is not None and selfcheck_config.enabled:
+        # 提取原始问题
+        for i in range(batch_size):
+            text = tokenizer.decode(x[i].tolist())
+            parts = text.split(lib.datasets.SEP_TOKEN)
+            original_questions.append(parts[0].strip())
+    
+    for step_idx in range(args.cot_steps):
+        # 生成下一个推理步骤
+        new_x = generate_samples(
+            x[unfinished], 
+            src_mask[unfinished], 
+            modules, 
+            args,
+            tokenizer=tokenizer,
+            selfcheck_verifier=selfcheck_verifier,
+            selfcheck_config=selfcheck_config
+        )
+        
+        # 对每个样本进行处理
+        if tokenizer is not None and selfcheck_config is not None and selfcheck_config.enabled and selfcheck_verifier is not None and original_questions:
+            batch_indices = torch.where(unfinished)[0]
+            for i, batch_idx in enumerate(batch_indices):
+                # 提取当前生成的步骤
+                current_text = tokenizer.decode(new_x[i].tolist())
+                current_parts = current_text.split(lib.datasets.SEP_TOKEN)
+                
+                if len(current_parts) > 1:
+                    # 提取最后一个步骤
+                    current_step = current_parts[-1].strip()
+                    
+                    if current_step:
+                        try:
+                            # 进行验证
+                            confidence, verified_step = selfcheck_verifier.verify_step(
+                                original_questions[batch_idx],
+                                current_step,
+                                all_steps[batch_idx],
+                                step_idx
+                            )
+                            
+                            # 更新总体置信度
+                            confidence_scores[batch_idx] *= confidence
+                            
+                            # 如果置信度低且需要修正
+                            if confidence < selfcheck_config.confidence_threshold and selfcheck_config.apply_corrections:
+                                # 替换最后一个步骤
+                                new_text = original_questions[batch_idx] + lib.datasets.SEP_TOKEN
+                                if all_steps[batch_idx]:
+                                    new_text += lib.datasets.SEP_TOKEN.join(all_steps[batch_idx]) + lib.datasets.SEP_TOKEN
+                                new_text += verified_step
+                                
+                                # 重新编码
+                                new_tokens = tokenizer.encode(new_text)[:new_x.shape[1]]
+                                # 如果长度不足，填充
+                                if len(new_tokens) < new_x.shape[1]:
+                                    padding = [lib.datasets.PAD_TOKEN_ID] * (new_x.shape[1] - len(new_tokens))
+                                    new_tokens.extend(padding)
+                                
+                                # 更新new_x
+                                new_x[i] = torch.tensor(new_tokens, device=new_x.device)
+                            
+                            # 更新all_steps
+                            if current_step:
+                                all_steps[batch_idx].append(current_step if confidence >= selfcheck_config.confidence_threshold 
+                                                         else verified_step)
+                        except Exception as e:
+                            # 发生错误时记录并继续
+                            if current_step:
+                                all_steps[batch_idx].append(current_step)
+                            logging.warning(f"SelfCheck error: {e}")
+        
+        # 更新生成结果
+        x[unfinished] = new_x
+        
+        # 检查是否完成
         for i, item in enumerate(x):
             if unfinished[i] and lib.datasets.EOS_TOKEN_ID in item: 
                 unfinished[i] = False
@@ -218,9 +414,12 @@ def generate_cot_samples(x, src_mask, modules, args):
         
         # for unfinished x, remove sep, add sep at the first pad position   
         x[unfinished], src_mask[unfinished] = shift_sep_to_pad(x[unfinished], sep_idx=lib.datasets.SEP_TOKEN_ID, pad_idx=lib.datasets.PAD_TOKEN_ID)
-
-    return x
-
+    
+    # 如果启用了SelfCheck，返回置信度
+    if tokenizer is not None and selfcheck_config is not None and selfcheck_config.enabled:
+        return x, confidence_scores
+    else:
+        return x
 
 def set_seed(seed: int):
     random.seed(seed)
@@ -228,14 +427,12 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-
 def vote(pred_list):
     counts = {}
     for pred in pred_list:
         counts[pred] = counts.get(pred, 0) + 1
     count_sorted = sorted(counts.items(), key=lambda x: x[1])
     return count_sorted[-1][0]
-
 
 def evaluate(
         args, 
@@ -246,8 +443,24 @@ def evaluate(
         runs=1,
         apply_sc=False,
     ):
+    """评估函数，增加SelfCheck支持"""
     results = []
-    print(f"total instances: {len(test_loader.dataset)}")
+    
+    # 创建SelfCheck验证器和配置
+    selfcheck_verifier = None
+    selfcheck_config = None
+    
+    # 检查是否启用SelfCheck
+    if hasattr(args, 'use_selfcheck') and args.use_selfcheck:
+        selfcheck_config = SelfCheckConfig(
+            enabled=args.use_selfcheck,
+            confidence_threshold=args.selfcheck_threshold if hasattr(args, 'selfcheck_threshold') else 0.7,
+            apply_corrections=args.selfcheck_apply_corrections if hasattr(args, 'selfcheck_apply_corrections') else True
+        )
+        selfcheck_verifier = SelfCheckVerifier(tokenizer, modules, args)
+        logging.info(f"SelfCheck enabled: threshold={selfcheck_config.confidence_threshold}, apply_corrections={selfcheck_config.apply_corrections}")
+    
+    logging.info(f"total instances: {len(test_loader.dataset)}")
     for run in range(runs):
         logging.info(f"evaluating {args.dataset} at Run {run}...")
         set_seed(2024+run)
@@ -255,6 +468,10 @@ def evaluate(
         local_corr = 0
         local_total = 0
         local_result = []
+        
+        # 保存置信度记录
+        all_confidences = []
+        
         for i, batch in enumerate(test_loader):
             x, src_mask, tgt_texts, task_ids = batch
             x = x.cuda()
@@ -262,30 +479,56 @@ def evaluate(
             task_ids = task_ids.tolist()
 
             if args.cot:
-                res_ids = generate_cot_samples(x, src_mask, modules, args)
+                if selfcheck_config and selfcheck_config.enabled:
+                    res_ids, confidences = generate_cot_samples(
+                        x, src_mask, modules, args, tokenizer, selfcheck_verifier, selfcheck_config
+                    )
+                    all_confidences.extend(confidences.tolist())
+                else:
+                    res_ids = generate_cot_samples(x, src_mask, modules, args)
             else:
-                res_ids = generate_samples(x, src_mask, modules, args)
+                res_ids = generate_samples(
+                    x, src_mask, modules, args, 
+                    tokenizer=tokenizer, 
+                    selfcheck_verifier=selfcheck_verifier, 
+                    selfcheck_config=selfcheck_config
+                )
 
             res_txts = ids_to_txts(tokenizer, res_ids)
 
-            for res_txt, tgt_text, task_id in zip(res_txts, tgt_texts, task_ids):
+            for j, (res_txt, tgt_text, task_id) in enumerate(zip(res_txts, tgt_texts, task_ids)):
                 if log_interval:
                     # ori_item = test_loader.dataset.dataset[i*args.batch_size*lib.ddp.world_size()+j*lib.ddp.world_size()+lib.ddp.rank()]
                     log_txt = res_txt.replace(lib.datasets.SEP_TOKEN, "").replace(lib.datasets.PAD_TOKEN, "")
                     logging.info(log_txt)
+                    
+                    # 如果启用了SelfCheck，显示置信度
+                    if selfcheck_config and selfcheck_config.enabled and args.cot:
+                        confidence_idx = i * x.shape[0] + j
+                        if confidence_idx < len(all_confidences):
+                            confidence = all_confidences[confidence_idx]
+                            logging.info(f"Confidence: {confidence:.4f}")
             
                 if args.dataset in ['gsm8k', '5by5', '4by4']:
                     pred = eval(f"extract_{args.dataset}_answer")(res_txt)
                     gold = eval(f"extract_{args.dataset}_answer")(tgt_text)
-                    local_result.append(
-                        {
-                            "task_id": int(task_id),
-                            "pred": pred,
-                            "gold": gold,
-                        }
-                    )
+                    
+                    result_item = {
+                        "task_id": int(task_id),
+                        "pred": pred,
+                        "gold": gold,
+                    }
+                    
+                    # 添加置信度信息
+                    if selfcheck_config and selfcheck_config.enabled and args.cot:
+                        confidence_idx = i * x.shape[0] + j
+                        if confidence_idx < len(all_confidences):
+                            result_item["confidence"] = all_confidences[confidence_idx]
+                    
+                    local_result.append(result_item)
                     local_corr += pred == gold
                     local_total += 1
+                    
                     if log_interval:
                         logging.info(f"pred:{pred}; gold:{gold}; local idx/corr/acc: {local_total}/{local_corr}/{local_corr/local_total}")
                 
@@ -305,6 +548,25 @@ def evaluate(
             acc = corr/total
             logging.info(f"total: {total}, corr: {corr}, acc: {acc}")
             logging.info(f"time: {time.time()-start_time}s")
+            
+            # 如果启用了SelfCheck，分析置信度与准确性的关系
+            if selfcheck_config and selfcheck_config.enabled and args.cot and all_confidences:
+                # 按置信度分组分析准确率
+                confidence_bins = [0.0, 0.5, 0.7, 0.9, 1.0]
+                for i in range(len(confidence_bins) - 1):
+                    lower = confidence_bins[i]
+                    upper = confidence_bins[i+1]
+                    
+                    # 计算该置信度区间的样本数和准确数
+                    bin_samples = [result for j, result in enumerate(local_result) 
+                                  if "confidence" in result and 
+                                  lower <= result["confidence"] < upper]
+                    
+                    if bin_samples:
+                        bin_correct = sum(1 for result in bin_samples if result["pred"] == result["gold"])
+                        bin_acc = bin_correct / len(bin_samples)
+                        logging.info(f"Confidence [{lower:.1f}, {upper:.1f}): samples={len(bin_samples)}, acc={bin_acc:.4f}")
+            
             results.append(acc)
 
     if apply_sc:
@@ -319,6 +581,11 @@ def evaluate(
                     results_dict[item["task_id"]]["gold"] = item["gold"]
                 else:
                     assert results_dict[item["task_id"]]["gold"] == item["gold"]
+                    
+                # 添加置信度
+                if "confidence" in item:
+                    results_dict[item["task_id"]]["confidences"] = results_dict[item["task_id"]].get("confidences", []) + [item["confidence"]]
+                
         # convert to a list of dicts with keys: preds, gold
         results_list = []
         for task_id in results_dict:
@@ -334,6 +601,29 @@ def evaluate(
                     corr += 1
                 acc = corr/total
             logging.info(f"[[Self-consistency @ {vote_at_k}]]: {total}, corr: {corr}, acc: {acc}")
+            
+            # 如果有置信度信息，尝试基于置信度加权投票
+            if "confidences" in results_list[0]:
+                corr_weighted = 0
+                for res in results_list:
+                    # 获取前vote_at_k个预测和置信度
+                    preds = res["preds"][:vote_at_k]
+                    confs = res["confidences"][:vote_at_k]
+                    
+                    # 加权计数
+                    weighted_counts = {}
+                    for p, c in zip(preds, confs):
+                        weighted_counts[p] = weighted_counts.get(p, 0) + c
+                    
+                    # 选择加权最高的预测
+                    weighted_pred = max(weighted_counts.items(), key=lambda x: x[1])[0]
+                    gold = res["gold"]
+                    if weighted_pred == gold:
+                        corr_weighted += 1
+                
+                acc_weighted = corr_weighted/total
+                logging.info(f"[[Self-consistency weighted @ {vote_at_k}]]: {total}, corr: {corr_weighted}, acc: {acc_weighted}")
+                
         return acc
     else:
         # Calculate mean and std
@@ -341,7 +631,6 @@ def evaluate(
         std = np.std(results)
         logging.info(f"Mean: {mean}, Std: {std}")
         return mean
-
 
 def main(**args):
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -374,6 +663,11 @@ def main(**args):
     args.setdefault('digit', False) # 
     args.setdefault('limit', False) # limit 5 instances
     
+    # 添加SelfCheck相关参数
+    args.setdefault('use_selfcheck', False)  # 是否启用SelfCheck
+    args.setdefault('selfcheck_threshold', 0.7)  # SelfCheck置信度阈值
+    args.setdefault('selfcheck_apply_corrections', True)  # 是否应用SelfCheck修正
+    
     eval_log_name = f"eval-{args.sampling_timesteps}-score_{args.score_temp}"
     if args.apply_sc:
         eval_log_name += f'-sc'
@@ -381,6 +675,8 @@ def main(**args):
         eval_log_name += '-dpmsolver'
     if args.logit_sample:
         eval_log_name += f'-logit-{args.logit_temp}'
+    if args.use_selfcheck:
+        eval_log_name += f'-selfcheck-{args.selfcheck_threshold}'
 
     args.eval_log = os.path.join(args.weights_path, f"{eval_log_name}.log")
     if lib.ddp.rank() == 0:
@@ -452,7 +748,6 @@ def main(**args):
         runs=args.runs,
         apply_sc=args.apply_sc
     )
-
 
 if __name__ == '__main__':
     fire.Fire(lib.ddp.wrap_main(main))

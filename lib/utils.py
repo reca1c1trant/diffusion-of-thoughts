@@ -71,7 +71,11 @@ def train_loop(
     grad_accum_steps=1,
     ddp_models=[],
     clip_params=[],
-    clip_quantile=0.95
+    clip_quantile=0.95,
+
+    tokenizer=None,
+    selfcheck_verifier=None,
+    selfcheck_config=None
     ):
 
     def lr_fn(step):
@@ -109,7 +113,10 @@ def train_loop(
                 forward_vals = forward(
                     step,
                     (accum_step * lib.ddp.world_size()) + lib.ddp.rank(),
-                    lib.ddp.world_size() * grad_accum_steps
+                    lib.ddp.world_size() * grad_accum_steps,
+                    tokenizer=tokenizer,
+                    selfcheck_verifier=selfcheck_verifier,
+                    selfcheck_config=selfcheck_config
                 )
                 if not isinstance(forward_vals, tuple):
                     forward_vals = (forward_vals,)
@@ -148,6 +155,125 @@ def train_loop(
                 means['step_time'],
                 means['loss'],
                 *[means[name] for name in names],
+                means['grad_norm'],
+                torch.cuda.max_memory_allocated() / (1024**3)
+            )
+            histories.clear()
+
+        if hook is not None:
+            hook(step)
+
+        if step == 0:
+            start_time = time.time()
+
+def train_loop_with_selfcheck(
+    forward,
+    opt,
+    steps,
+    names=[],
+    hook=None,
+    print_freq=1000,
+    first_step=0,
+    lr_warmup_steps=0,
+    lr_decay=False,
+    amp_grad_scaler=True,
+    grad_accum_steps=1,
+    ddp_models=[],
+    clip_params=[],
+    clip_quantile=0.95,
+    tokenizer=None,  # 添加tokenizer参数
+    selfcheck_verifier=None,  # 添加SelfCheck验证器
+    selfcheck_config=None  # SelfCheck配置
+    ):
+    """
+    支持SelfCheck的训练循环
+    """
+    # 大部分逻辑与原始train_loop相同
+    
+    def lr_fn(step):
+        if (step - first_step) < 10:
+            # Zero LR for the first 10 steps to warm up Adam
+            return 0.
+        elif step < lr_warmup_steps:
+            return float(step) / lr_warmup_steps
+        elif lr_decay:
+            # Linear to zero
+            return 1. - (float(step-lr_warmup_steps) / (1e-8+steps-lr_warmup_steps))
+        else:
+            return 1.
+    scheduler = optim.lr_scheduler.LambdaLR(opt, lr_fn)
+
+    # 添加SelfCheck损失到输出列
+    selfcheck_names = names + ['selfcheck_loss'] if selfcheck_config and selfcheck_config.enabled else names
+    
+    print_row('step', 'step time', 'loss', *selfcheck_names, 'grad norm', 'mem')
+    histories = collections.defaultdict(lambda: [])
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_grad_scaler)
+    start_time = time.time()
+    prev_grad_norms = torch.full([1000], 1e8, device='cuda')
+    
+    for step in range(steps):
+
+        if step < first_step:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                scheduler.step()
+            continue
+
+        for accum_step in range(grad_accum_steps):
+
+            with contextlib.ExitStack() as stack:
+                if accum_step < grad_accum_steps - 1:
+                    for m in ddp_models:
+                        stack.enter_context(m.no_sync())
+                
+                # 调用forward函数，需要支持SelfCheck
+                forward_vals = forward(
+                    step,
+                    (accum_step * lib.ddp.world_size()) + lib.ddp.rank(),
+                    lib.ddp.world_size() * grad_accum_steps,
+                    tokenizer=tokenizer,  # 传递tokenizer
+                    selfcheck_verifier=selfcheck_verifier,  # 传递SelfCheck验证器
+                    selfcheck_config=selfcheck_config  # 传递SelfCheck配置
+                )
+                if not isinstance(forward_vals, tuple):
+                    forward_vals = (forward_vals,)
+
+                scaled_loss = forward_vals[0] / grad_accum_steps
+                scaler.scale(scaled_loss).backward()
+
+            histories['loss'].append(forward_vals[0].item())
+            for name, val in zip(selfcheck_names, forward_vals[1:]):
+                histories[name].append(val.item())
+
+            del forward_vals
+
+        # 后续步骤与原始train_loop相同
+        scaler.unscale_(opt)
+        with torch.no_grad():
+            threshold = torch.quantile(prev_grad_norms, clip_quantile)
+            grad_norm = nn.utils.clip_grad_norm_(clip_params, threshold)
+            histories['grad_norm'].append(grad_norm.item())
+            prev_grad_norms[step % len(prev_grad_norms)] = grad_norm
+        scaler.step(opt)
+        scaler.update()
+        opt.zero_grad(set_to_none=True)
+  
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            scheduler.step()
+
+        if (step==0) or (step % print_freq == (print_freq - 1)):
+            means = {
+                name: lib.ddp.reduce_mean(np.mean(histories[name]))
+                for name in histories.keys()
+            }
+            means['step_time'] = (time.time() - start_time) / max(step - first_step, 1)
+            print_row(
+                step,
+                means['step_time'],
+                means['loss'],
+                *[means[name] for name in selfcheck_names],
                 means['grad_norm'],
                 torch.cuda.max_memory_allocated() / (1024**3)
             )
